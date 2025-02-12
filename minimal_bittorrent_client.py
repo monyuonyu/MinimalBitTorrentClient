@@ -290,6 +290,10 @@ class PeerConnection(threading.Thread):
         """
         ソケットに対してメッセージを送信する関数
         """
+        # ソケットが存在しない場合は何もしない
+        if self.sock is None:
+            logger.error("ソケットが存在しないため、メッセージ送信をスキップします: %s:%s", self.ip, self.port)
+            return
         try:
             self.sock.sendall(msg)
             self.last_activity = time.time()  # 送信成功時に最終アクティビティ時刻を更新
@@ -300,14 +304,20 @@ class PeerConnection(threading.Thread):
         """
         ソケットからメッセージを受信する関数
         """
+        # ソケットが存在しない場合は何もしない
+        if self.sock is None:
+            logger.error("ソケットが存在しないため、メッセージ受信をスキップします: %s:%s", self.ip, self.port)
+            return None
         try:
+            # まず4バイトでメッセージ長を受信
             length_data = recv_all(self.sock, 4)
             if len(length_data) < 4:
                 return None
             msg_length = struct.unpack("!I", length_data)[0]
-            # メッセージ長が 0 の場合は keep-alive
+            # メッセージ長が0の場合はkeep-alive
             if msg_length == 0:
                 return {"id": None, "payload": None}
+            # 残りのバイトを受信
             msg_data = recv_all(self.sock, msg_length)
             if len(msg_data) < msg_length:
                 return None
@@ -315,8 +325,6 @@ class PeerConnection(threading.Thread):
             payload = msg_data[1:]
             self.last_activity = time.time()  # 受信成功時に最終アクティビティ時刻を更新
             return {"id": msg_id, "payload": payload}
-        except socket.timeout:
-            return None
         except Exception as e:
             logger.error("recv_message 中の例外 (%s:%s): %s", self.ip, self.port, e)
             return None
@@ -375,54 +383,60 @@ class PeerConnection(threading.Thread):
     def run(self):
         """
         ピアとの通信を行うメイン処理
-        ・接続・ハンドシェイクに対して再試行機能を追加
-        ・接続前にランダムなディレイを入れて負荷分散を図る
-        ・その後、通常のメッセージ送受信ループを実行
         """
         max_retries = 3  # 接続の最大再試行回数
         attempt = 0
         while attempt < max_retries and self.running:
             try:
-                # 接続前に短いランダム待機（0.1～0.5秒）を実施
+                # 接続前に短いランダム待機を実施
                 time.sleep(random.uniform(0.1, 0.5))
-                # ソケット接続（タイムアウト 10 秒）
                 self.sock = socket.create_connection((self.ip, self.port), timeout=10)
-                self.sock.settimeout(30)  # 受信タイムアウトを 30 秒に設定
+                self.sock.settimeout(30)  # 受信タイムアウトを30秒に設定
                 logger.info("ピア接続確立: %s:%s (試行 %d/%d)", self.ip, self.port, attempt+1, max_retries)
-                # ハンドシェイク送信および検証
                 self.send_handshake()
                 if not self.receive_handshake():
                     raise Exception("ハンドシェイク失敗")
-                # ハンドシェイク成功なら再試行ループを抜ける
-                break
+                break  # ハンドシェイク成功なら再試行ループを抜ける
             except Exception as e:
                 attempt += 1
                 logger.error("接続エラー (%s:%s): %s (試行 %d/%d)", self.ip, self.port, e, attempt, max_retries)
                 if self.sock:
                     self.sock.close()
                     self.sock = None
-                # 再試行前にランダムな待機（0.5～1.5秒）を実施
                 time.sleep(random.uniform(0.5, 1.5))
-        if attempt >= max_retries:
-            logger.error("最大再試行回数に達しました。接続を中止します: %s:%s", self.ip, self.port)
+        if attempt >= max_retries or self.sock is None:
+            logger.error("最大再試行回数に達またはソケットが取得できませんでした。接続を中止します: %s:%s", self.ip, self.port)
             return
 
-        # ハンドシェイク成功後、Interested メッセージを送信して以降の通信開始
         self.send_interested()
+        consecutive_failures = 0  # 連続エラー回数のカウンター
+        max_failures = 3  # 連続エラーが3回以上ならループを終了する
         while self.running:
+            # ソケットがなくなっている場合はループを抜ける
+            if self.sock is None:
+                logger.error("ソケットがなくなったのでループを終了します: %s:%s", self.ip, self.port)
+                break
             try:
-                # 一定時間無通信の場合、keep-alive を送信（メッセージ長 0 の 4 バイト）
                 if time.time() - self.last_activity > KEEPALIVE_INTERVAL:
                     self.send_message(struct.pack("!I", 0))
                     logger.debug("keep-alive 送信 (%s:%s)", self.ip, self.port)
                 msg = self.recv_message()
                 if msg is None:
+                    consecutive_failures += 1
+                    logger.warning("受信エラー回数: %d (%s:%s)", consecutive_failures, self.ip, self.port)
+                    if consecutive_failures >= max_failures:
+                        logger.error("連続受信エラーにより接続を終了します: %s:%s", self.ip, self.port)
+                        break
+                    time.sleep(0.5)
                     continue
-                # キープアライブの場合、msg["id"] は None
+                else:
+                    consecutive_failures = 0  # 受信成功時はカウンターをリセット
+
+                # キープアライブの場合はmsg["id"]がNone
                 if msg["id"] is None:
                     continue
+
                 msg_id = msg["id"]
-                # 受信メッセージの ID による処理分岐
                 if msg_id == 0:
                     self.choked = True
                     logger.debug("choke 受信 (%s:%s)", self.ip, self.port)
@@ -441,10 +455,8 @@ class PeerConnection(threading.Thread):
                     offset = struct.unpack("!I", msg["payload"][4:8])[0]
                     block_data = msg["payload"][8:]
                     logger.debug("piece 受信: ピース %d, オフセット %d, サイズ %d (%s:%s)",
-                                 piece_index, offset, len(block_data), self.ip, self.port)
-                    # 受信ブロックを PieceManager に登録・検証
+                                piece_index, offset, len(block_data), self.ip, self.port)
                     self.piece_manager.mark_block_received(piece_index, offset, block_data)
-                # choke 状態でなければ、次のブロックリクエストを送信
                 if not self.choked:
                     req = self.piece_manager.get_next_request()
                     if req is not None:
