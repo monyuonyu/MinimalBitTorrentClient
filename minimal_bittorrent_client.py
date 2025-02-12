@@ -263,7 +263,7 @@ class PieceManager:
 # クラス：PeerConnection
 # 概要：
 #   各ピアとの通信を担当するスレッドクラスです。
-#   ハンドシェイク、Interested メッセージ送信、ピースデータの受信、ブロックリクエストなどを行います。
+#   ここでは、接続時の再試行機能と接続前のランダムディレイを追加しています。
 # -----------------------------------------------------------
 class PeerConnection(threading.Thread):
     def __init__(self, ip, port, info_hash, peer_id, piece_manager):
@@ -288,8 +288,7 @@ class PeerConnection(threading.Thread):
 
     def send_message(self, msg):
         """
-        ソケットに対してメッセージを送信する
-        :param msg: 送信するバイナリデータ
+        ソケットに対してメッセージを送信する関数
         """
         try:
             self.sock.sendall(msg)
@@ -299,19 +298,16 @@ class PeerConnection(threading.Thread):
 
     def recv_message(self):
         """
-        ソケットからメッセージを受信する
-        :return: 辞書形式 { "id": msg_id, "payload": payload } または None
+        ソケットからメッセージを受信する関数
         """
         try:
-            # まず 4 バイトでメッセージ長を受信
             length_data = recv_all(self.sock, 4)
             if len(length_data) < 4:
                 return None
             msg_length = struct.unpack("!I", length_data)[0]
-            # メッセージ長が 0 の場合は keep-alive メッセージ
+            # メッセージ長が 0 の場合は keep-alive
             if msg_length == 0:
                 return {"id": None, "payload": None}
-            # 残りの msg_length バイトを受信
             msg_data = recv_all(self.sock, msg_length)
             if len(msg_data) < msg_length:
                 return None
@@ -327,8 +323,8 @@ class PeerConnection(threading.Thread):
 
     def send_handshake(self):
         """
-        ハンドシェイクメッセージを作成して送信する
-        ※ BitTorrent プロトコルでは、ハンドシェイクメッセージは 68 バイト固定です。
+        ハンドシェイクメッセージを送信する関数
+        ※ BitTorrent プロトコルのハンドシェイクは 68 バイト固定です。
         """
         pstr = b"BitTorrent protocol"
         pstrlen = len(pstr)
@@ -339,7 +335,7 @@ class PeerConnection(threading.Thread):
 
     def receive_handshake(self):
         """
-        ハンドシェイクメッセージを受信し、内容を検証する
+        ハンドシェイクメッセージを受信し、内容を検証する関数
         :return: True（成功） / False（失敗）
         """
         handshake = recv_all(self.sock, 68)
@@ -349,7 +345,7 @@ class PeerConnection(threading.Thread):
         pstr = handshake[1:1+pstrlen]
         if pstr != b"BitTorrent protocol":
             return False
-        # 受信した info_hash 部分と自分が送信した info_hash の一致確認
+        # 受信した info_hash と自分が送信した info_hash の比較
         received_info_hash = handshake[1+pstrlen+8:1+pstrlen+8+20]
         if received_info_hash != self.info_hash:
             return False
@@ -358,16 +354,15 @@ class PeerConnection(threading.Thread):
 
     def send_interested(self):
         """
-        Interested メッセージ（ID=2）を送信する
-        ※ ピアに対して「このピースが欲しい」という意思表示です。
+        Interested メッセージ（ID=2）を送信する関数
         """
-        msg = struct.pack("!Ib", 1, 2)  # 1 バイトの長さと、ID=2
+        msg = struct.pack("!Ib", 1, 2)  # 長さ 1 と ID=2
         self.send_message(msg)
         logger.debug("Interested 送信 (%s:%s)", self.ip, self.port)
 
     def send_request(self, piece_index, offset, length):
         """
-        Request メッセージ（ID=6）を送信する
+        Request メッセージ（ID=6）を送信する関数
         :param piece_index: リクエストするピース番号
         :param offset: ピース内のオフセット
         :param length: リクエストするブロックの長さ
@@ -379,36 +374,55 @@ class PeerConnection(threading.Thread):
 
     def run(self):
         """
-        スレッドのエントリーポイント。ピアとの通信処理全般を行う。
-        ・ソケットの接続確立、ハンドシェイク、Interested の送信
-        ・受信メッセージの解析と対応処理（choke, unchoke, piece, have など）
-        ・受信したピースブロックの登録と次ブロックのリクエスト
-        ・一定時間無通信の場合は keep-alive の送信
+        ピアとの通信を行うメイン処理
+        ・接続・ハンドシェイクに対して再試行機能を追加
+        ・接続前にランダムなディレイを入れて負荷分散を図る
+        ・その後、通常のメッセージ送受信ループを実行
         """
-        try:
-            # ソケット接続（タイムアウト 10 秒）
-            self.sock = socket.create_connection((self.ip, self.port), timeout=10)
-            self.sock.settimeout(30)  # 受信タイムアウトを 30 秒に設定
-            logger.info("ピア接続確立: %s:%s", self.ip, self.port)
-            self.send_handshake()
-            if not self.receive_handshake():
-                logger.error("ハンドシェイク失敗: %s:%s", self.ip, self.port)
-                return
-            # ハンドシェイク成功後、Interested メッセージを送信してピースのリクエスト開始
-            self.send_interested()
-            while self.running:
-                # 一定時間無通信の場合は keep-alive を送信（メッセージ長 0 の 4 バイト）
+        max_retries = 3  # 接続の最大再試行回数
+        attempt = 0
+        while attempt < max_retries and self.running:
+            try:
+                # 接続前に短いランダム待機（0.1～0.5秒）を実施
+                time.sleep(random.uniform(0.1, 0.5))
+                # ソケット接続（タイムアウト 10 秒）
+                self.sock = socket.create_connection((self.ip, self.port), timeout=10)
+                self.sock.settimeout(30)  # 受信タイムアウトを 30 秒に設定
+                logger.info("ピア接続確立: %s:%s (試行 %d/%d)", self.ip, self.port, attempt+1, max_retries)
+                # ハンドシェイク送信および検証
+                self.send_handshake()
+                if not self.receive_handshake():
+                    raise Exception("ハンドシェイク失敗")
+                # ハンドシェイク成功なら再試行ループを抜ける
+                break
+            except Exception as e:
+                attempt += 1
+                logger.error("接続エラー (%s:%s): %s (試行 %d/%d)", self.ip, self.port, e, attempt, max_retries)
+                if self.sock:
+                    self.sock.close()
+                    self.sock = None
+                # 再試行前にランダムな待機（0.5～1.5秒）を実施
+                time.sleep(random.uniform(0.5, 1.5))
+        if attempt >= max_retries:
+            logger.error("最大再試行回数に達しました。接続を中止します: %s:%s", self.ip, self.port)
+            return
+
+        # ハンドシェイク成功後、Interested メッセージを送信して以降の通信開始
+        self.send_interested()
+        while self.running:
+            try:
+                # 一定時間無通信の場合、keep-alive を送信（メッセージ長 0 の 4 バイト）
                 if time.time() - self.last_activity > KEEPALIVE_INTERVAL:
                     self.send_message(struct.pack("!I", 0))
                     logger.debug("keep-alive 送信 (%s:%s)", self.ip, self.port)
                 msg = self.recv_message()
                 if msg is None:
                     continue
-                # キープアライブの場合は、msg["id"] が None となる
+                # キープアライブの場合、msg["id"] は None
                 if msg["id"] is None:
                     continue
                 msg_id = msg["id"]
-                # メッセージ ID に応じた処理を実施
+                # 受信メッセージの ID による処理分岐
                 if msg_id == 0:
                     self.choked = True
                     logger.debug("choke 受信 (%s:%s)", self.ip, self.port)
@@ -416,14 +430,11 @@ class PeerConnection(threading.Thread):
                     self.choked = False
                     logger.debug("unchoke 受信 (%s:%s)", self.ip, self.port)
                 elif msg_id == 4:
-                    # have メッセージ：4 バイトのピース番号が含まれる
                     piece_index = struct.unpack("!I", msg["payload"])[0]
                     logger.debug("have 受信: ピース %d (%s:%s)", piece_index, self.ip, self.port)
                 elif msg_id == 5:
-                    # bitfield メッセージ（詳細解析は省略）
                     logger.debug("bitfield 受信 (%s:%s)", self.ip, self.port)
                 elif msg_id == 7:
-                    # piece メッセージ：4 バイトのピース番号、4 バイトのオフセット、残りがデータブロック
                     if len(msg["payload"]) < 8:
                         continue
                     piece_index = struct.unpack("!I", msg["payload"][:4])[0]
@@ -431,20 +442,20 @@ class PeerConnection(threading.Thread):
                     block_data = msg["payload"][8:]
                     logger.debug("piece 受信: ピース %d, オフセット %d, サイズ %d (%s:%s)",
                                  piece_index, offset, len(block_data), self.ip, self.port)
-                    # 受信ブロックを PieceManager に通知して登録・検証を行う
+                    # 受信ブロックを PieceManager に登録・検証
                     self.piece_manager.mark_block_received(piece_index, offset, block_data)
-                # ピアが unchoke 状態であれば、次のブロックリクエストを送信
+                # choke 状態でなければ、次のブロックリクエストを送信
                 if not self.choked:
                     req = self.piece_manager.get_next_request()
                     if req is not None:
                         piece_index, offset, req_length = req
                         self.send_request(piece_index, offset, req_length)
-        except Exception as e:
-            logger.error("ピア通信エラー (%s:%s): %s", self.ip, self.port, e)
-        finally:
-            if self.sock:
-                self.sock.close()
-            logger.info("ピア接続終了: %s:%s", self.ip, self.port)
+            except Exception as e:
+                logger.error("ピア通信中のエラー (%s:%s): %s", self.ip, self.port, e)
+                break
+        if self.sock:
+            self.sock.close()
+        logger.info("ピア接続終了: %s:%s", self.ip, self.port)
 
 # -----------------------------------------------------------
 # クラス：TorrentClient
