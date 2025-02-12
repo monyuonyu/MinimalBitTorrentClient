@@ -120,6 +120,7 @@ class TrackerClient:
             f"&downloaded=0"
             f"&left={self.left}"
             f"&compact=1"
+            f"&numwant=200"
         )
         try:
             logger.info("トラッカーに問い合わせ中: %s", url)
