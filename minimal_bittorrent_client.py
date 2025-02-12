@@ -606,29 +606,64 @@ class TorrentClient:
         ・ダウンロード進捗の監視
         ・ダウンロード完了後のファイル組み立て
         """
+        # torrent ファイルの読み込みなどの初期化は既存のコード通り
         self.load_torrent()
+        
+        # 初回のトラッカー問い合わせ
         tracker = TrackerClient(self.announce_url, self.info_hash, self.peer_id, self.port, self.left)
         self.peers = tracker.contact_tracker()
         logger.info("取得ピア数: %d", len(self.peers))
-        # 各ピアとの接続スレッドを生成して起動する
+        
+        # 既に接続済みのピアを管理するためのセットを用意
+        self.existing_peers = set()
+        
+        # 初回取得したピア情報に対して接続スレッドを生成
         for ip, port in self.peers:
+            self.existing_peers.add((ip, port))
             pc = PeerConnection(ip, port, self.info_hash, self.peer_id, self.piece_manager)
             pc.start()
             self.peer_connections.append(pc)
-        # ダウンロード進捗を監視するループ
+        
+        # 進捗監視と再接続のロジック
+        last_completed = 0
+        stagnant_time = 0  # 進捗が停滞している時間（秒）
         try:
             while not self.piece_manager.is_complete():
+                # 現在の完成ピース数をカウント
                 completed = sum(1 for i in self.piece_manager.piece_info if self.piece_manager.piece_info[i]["complete"])
                 percent = completed / self.piece_manager.total_pieces * 100
-                logger.info("ダウンロード進捗: %d/%d ピース (%.2f%%)", completed, self.piece_manager.total_pieces, percent)
+                logger.info("ダウンロード進捗: %d/%d ピース (%.2f%%)", 
+                            completed, self.piece_manager.total_pieces, percent)
+                
+                # 進捗があった場合はカウンターをリセット
+                if completed > last_completed:
+                    last_completed = completed
+                    stagnant_time = 0
+                else:
+                    stagnant_time += 5  # このループは約5秒間隔で実行
+                
+                # 30秒以上進捗がなかった場合は、再接続を試みる
+                if stagnant_time >= 30:
+                    logger.info("進捗が停滞しているため、トラッカーから再度ピア情報を取得します。")
+                    new_tracker = TrackerClient(self.announce_url, self.info_hash, self.peer_id, self.port, self.left)
+                    new_peers = new_tracker.contact_tracker()
+                    for ip, port in new_peers:
+                        # 重複しないピアだけ新たに接続する
+                        if (ip, port) not in self.existing_peers:
+                            self.existing_peers.add((ip, port))
+                            pc = PeerConnection(ip, port, self.info_hash, self.peer_id, self.piece_manager)
+                            pc.start()
+                            self.peer_connections.append(pc)
+                    stagnant_time = 0  # 再問い合わせ後、停滞時間をリセット
+                
                 time.sleep(5)
         except KeyboardInterrupt:
             logger.warning("ユーザーによる中断")
         finally:
-            # 全てのピア接続スレッドに対して終了フラグをセット
+            # 全ピア接続スレッドの終了フラグをセット
             for pc in self.peer_connections:
                 pc.running = False
-            # ダウンロードが完了している場合、ファイルの組み立てを実施
+            # すべてのピースが揃っていれば、ファイルの組み立てを実施
             if self.piece_manager.is_complete():
                 info = self.meta_info.get("info")
                 if b"files" in info or "files" in info:
