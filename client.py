@@ -8,6 +8,7 @@ from utils import logger
 from tracker import TrackerClient
 from piece_manager import PieceManager
 from peer import PeerConnection
+from dht import DHTClient
 
 # -----------------------------------------------------------
 # クラス：TorrentClient
@@ -34,6 +35,7 @@ class TorrentClient:
         self.peer_connections = []  # ピアとの接続スレッドのリスト
         # 自身が利用するポートはランダムに選択
         self.port = random.randint(10000, 60000)
+        self.dht_client = DHTClient()
 
     def load_torrent(self):
         """
@@ -136,6 +138,19 @@ class TorrentClient:
         except Exception as e:
             logger.error("マルチファイル組み立てエラー: %s", e)
 
+    def add_peer(self, peer):
+        """\
+        新しいピアをセットに追加し、接続スレッドを起動します。
+        :param peer: (ip, port) のタプル
+        """
+        ip, port = peer
+        if (ip, port) in self.existing_peers:
+            return
+        self.existing_peers.add((ip, port))
+        pc = PeerConnection(ip, port, self.info_hash, self.peer_id, self.piece_manager, peer_callback=self.add_peer)
+        pc.start()
+        self.peer_connections.append(pc)
+
     def start(self):
         """
         torrent 処理のメイン処理を開始するメソッド
@@ -149,18 +164,20 @@ class TorrentClient:
         
         # 初回のトラッカー問い合わせ
         tracker = TrackerClient(self.announce_url, self.info_hash, self.peer_id, self.port, self.left)
-        self.peers = tracker.contact_tracker()
-        logger.info("取得ピア数: %d", len(self.peers))
-        
+        tracker_peers = tracker.contact_tracker()
+        logger.info("取得ピア数: %d", len(tracker_peers))
+
         # 既に接続済みのピアを管理するためのセットを用意
         self.existing_peers = set()
-        
-        # 初回取得したピア情報に対して接続スレッドを生成
-        for ip, port in self.peers:
-            self.existing_peers.add((ip, port))
-            pc = PeerConnection(ip, port, self.info_hash, self.peer_id, self.piece_manager)
-            pc.start()
-            self.peer_connections.append(pc)
+
+        for peer in tracker_peers:
+            self.add_peer(peer)
+
+        # DHT からピア情報を取得
+        dht_peers = self.dht_client.get_peers(self.info_hash)
+        logger.info("DHT 取得ピア数: %d", len(dht_peers))
+        for peer in dht_peers:
+            self.add_peer(peer)
         
         # 進捗監視と再接続のロジック
         last_completed = 0
@@ -182,16 +199,14 @@ class TorrentClient:
                 
                 # 30秒以上進捗がなかった場合は、再接続を試みる
                 if stagnant_time >= 30:
-                    logger.info("進捗が停滞しているため、トラッカーから再度ピア情報を取得します。")
+                    logger.info("進捗が停滞しているため、トラッカー/DHT から再度ピア情報を取得します。")
                     new_tracker = TrackerClient(self.announce_url, self.info_hash, self.peer_id, self.port, self.left)
                     new_peers = new_tracker.contact_tracker()
-                    for ip, port in new_peers:
-                        # 重複しないピアだけ新たに接続する
-                        if (ip, port) not in self.existing_peers:
-                            self.existing_peers.add((ip, port))
-                            pc = PeerConnection(ip, port, self.info_hash, self.peer_id, self.piece_manager)
-                            pc.start()
-                            self.peer_connections.append(pc)
+                    for peer in new_peers:
+                        self.add_peer(peer)
+                    dht_peers = self.dht_client.get_peers(self.info_hash)
+                    for peer in dht_peers:
+                        self.add_peer(peer)
                     stagnant_time = 0  # 再問い合わせ後、停滞時間をリセット
                 
                 time.sleep(5)

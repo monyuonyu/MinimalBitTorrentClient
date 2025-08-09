@@ -3,6 +3,7 @@ import threading
 import struct
 import random
 import time
+import bencodepy
 from utils import recv_all, logger
 from constants import BLOCK_SIZE, KEEPALIVE_INTERVAL
 
@@ -13,7 +14,7 @@ from constants import BLOCK_SIZE, KEEPALIVE_INTERVAL
 #   ここでは、接続時の再試行機能と接続前のランダムディレイを追加しています。
 # -----------------------------------------------------------
 class PeerConnection(threading.Thread):
-    def __init__(self, ip, port, info_hash, peer_id, piece_manager):
+    def __init__(self, ip, port, info_hash, peer_id, piece_manager, peer_callback=None):
         """
         初期化処理
         :param ip: ピアの IP アドレス（文字列）
@@ -28,6 +29,8 @@ class PeerConnection(threading.Thread):
         self.info_hash = info_hash
         self.peer_id = peer_id
         self.piece_manager = piece_manager
+        self.peer_callback = peer_callback
+        self.pex_msg_id = None
         self.sock = None                # 通信に使用するソケット
         self.choked = True              # choke 状態かどうかのフラグ
         self.running = True             # スレッドが継続して動作するかのフラグ
@@ -107,6 +110,12 @@ class PeerConnection(threading.Thread):
         logger.debug("有効なハンドシェイク受信 (%s:%s)", self.ip, self.port)
         return True
 
+    def send_extended_handshake(self):
+        payload = bencodepy.encode({b"m": {b"ut_pex": 1}})
+        msg = struct.pack("!IBB", len(payload) + 2, 20, 0) + payload
+        self.send_message(msg)
+        logger.debug("extended handshake 送信 (%s:%s)", self.ip, self.port)
+
     def send_interested(self):
         """
         Interested メッセージ（ID=2）を送信する関数
@@ -154,7 +163,7 @@ class PeerConnection(threading.Thread):
         if attempt >= max_retries or self.sock is None:
             logger.error("最大再試行回数に達またはソケットが取得できませんでした。接続を中止します: %s:%s", self.ip, self.port)
             return
-
+        self.send_extended_handshake()
         self.send_interested()
         consecutive_failures = 0  # 連続エラー回数のカウンター
         max_failures = 3  # 連続エラーが3回以上ならループを終了する
@@ -195,6 +204,30 @@ class PeerConnection(threading.Thread):
                     logger.debug("have 受信: ピース %d (%s:%s)", piece_index, self.ip, self.port)
                 elif msg_id == 5:
                     logger.debug("bitfield 受信 (%s:%s)", self.ip, self.port)
+                elif msg_id == 20:
+                    if not msg["payload"]:
+                        continue
+                    ext_id = msg["payload"][0]
+                    ext_payload = msg["payload"][1:]
+                    if ext_id == 0:
+                        try:
+                            data = bencodepy.decode(ext_payload)
+                            m = data.get(b"m", {})
+                            if b"ut_pex" in m:
+                                self.pex_msg_id = m[b"ut_pex"]
+                        except Exception:
+                            pass
+                    elif self.pex_msg_id is not None and ext_id == self.pex_msg_id:
+                        try:
+                            data = bencodepy.decode(ext_payload)
+                            added = data.get(b"added", b"")
+                            for i in range(0, len(added), 6):
+                                ip = ".".join(str(b) for b in added[i:i+4])
+                                port = int.from_bytes(added[i+4:i+6], "big")
+                                if self.peer_callback:
+                                    self.peer_callback((ip, port))
+                        except Exception:
+                            pass
                 elif msg_id == 7:
                     if len(msg["payload"]) < 8:
                         continue
