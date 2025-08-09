@@ -1,6 +1,7 @@
 import hashlib
 import threading
 from utils import logger
+from constants import BLOCK_SIZE
 
 # -----------------------------------------------------------
 # クラス：PieceManager
